@@ -3,15 +3,26 @@ import { SearchBar } from "@/components/SearchBar";
 import { CategorySidebar } from "@/components/CategorySidebar";
 import { PromptCard } from "@/components/PromptCard";
 import { PromptDetail } from "@/components/PromptDetail";
+import { AddPromptDialog } from "@/components/AddPromptDialog";
+import { LoginDialog } from "@/components/LoginDialog";
 import { categories, prompts as initialPrompts } from "@/data/mockData";
 import { Prompt } from "@/types/prompt";
-import { Sparkles } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Sparkles, Plus, LogIn, User, LogOut } from "lucide-react";
+
+interface CurrentUser {
+  name: string;
+  email: string;
+}
 
 const Index = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [activeCategory, setActiveCategory] = useState("all");
   const [prompts, setPrompts] = useState<Prompt[]>(initialPrompts);
   const [selectedPrompt, setSelectedPrompt] = useState<Prompt | null>(null);
+  const [showAddDialog, setShowAddDialog] = useState(false);
+  const [showLoginDialog, setShowLoginDialog] = useState(false);
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
 
   const filteredPrompts = useMemo(() => {
     return prompts.filter((prompt) => {
@@ -60,6 +71,18 @@ const Index = () => {
     );
   };
 
+  const handleAddPrompt = (newPrompt: Prompt) => {
+    setPrompts((prev) => [newPrompt, ...prev]);
+  };
+
+  const handleLogin = (user: CurrentUser) => {
+    setCurrentUser(user);
+  };
+
+  const handleLogout = () => {
+    setCurrentUser(null);
+  };
+
   const handleTagClick = (tag: string) => {
     setSearchQuery(tag);
   };
@@ -69,7 +92,7 @@ const Index = () => {
       {/* Header */}
       <header className="sticky top-0 z-50 glass border-b border-border/50">
         <div className="container mx-auto px-6 py-4">
-          <div className="flex items-center justify-between gap-8">
+          <div className="flex items-center justify-between gap-4">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-cyan-400 flex items-center justify-center">
                 <Sparkles className="h-5 w-5 text-primary-foreground" />
@@ -82,8 +105,30 @@ const Index = () => {
             <div className="flex-1 max-w-xl">
               <SearchBar value={searchQuery} onChange={setSearchQuery} />
             </div>
-            <div className="text-sm text-muted-foreground">
-              共 <span className="font-semibold text-foreground">{prompts.length}</span> 个提示词
+            <div className="flex items-center gap-3">
+              <Button
+                onClick={() => setShowAddDialog(true)}
+                className="gap-2"
+              >
+                <Plus className="h-4 w-4" />
+                添加提示词
+              </Button>
+              {currentUser ? (
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-muted">
+                    <User className="h-4 w-4 text-muted-foreground" />
+                    <span className="text-sm font-medium text-foreground">{currentUser.name}</span>
+                  </div>
+                  <Button variant="ghost" size="icon" onClick={handleLogout}>
+                    <LogOut className="h-4 w-4" />
+                  </Button>
+                </div>
+              ) : (
+                <Button variant="outline" onClick={() => setShowLoginDialog(true)} className="gap-2">
+                  <LogIn className="h-4 w-4" />
+                  登录
+                </Button>
+              )}
             </div>
           </div>
         </div>
@@ -133,6 +178,20 @@ const Index = () => {
         open={!!selectedPrompt}
         onClose={() => setSelectedPrompt(null)}
         onVote={handleVote}
+      />
+
+      {/* Add Prompt Dialog */}
+      <AddPromptDialog
+        open={showAddDialog}
+        onClose={() => setShowAddDialog(false)}
+        onAdd={handleAddPrompt}
+      />
+
+      {/* Login Dialog */}
+      <LoginDialog
+        open={showLoginDialog}
+        onClose={() => setShowLoginDialog(false)}
+        onLogin={handleLogin}
       />
     </div>
   );
