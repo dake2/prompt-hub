@@ -1,10 +1,11 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { SearchBar } from "@/components/SearchBar";
 import { CategorySidebar } from "@/components/CategorySidebar";
 import { PromptCard } from "@/components/PromptCard";
 import { PromptDetail } from "@/components/PromptDetail";
 import { AddPromptDialog } from "@/components/AddPromptDialog";
 import { LoginDialog } from "@/components/LoginDialog";
+import { ThemeToggle } from "@/components/ThemeToggle";
 import { categories, prompts as initialPrompts } from "@/data/mockData";
 import { Prompt } from "@/types/prompt";
 import { Button } from "@/components/ui/button";
@@ -23,6 +24,20 @@ const Index = () => {
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [showLoginDialog, setShowLoginDialog] = useState(false);
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [isDark, setIsDark] = useState(true);
+
+  useEffect(() => {
+    const saved = localStorage.getItem("theme");
+    if (saved) {
+      setIsDark(saved === "dark");
+    }
+  }, []);
+
+  const toggleTheme = () => {
+    const newTheme = !isDark;
+    setIsDark(newTheme);
+    localStorage.setItem("theme", newTheme ? "dark" : "light");
+  };
 
   const filteredPrompts = useMemo(() => {
     return prompts.filter((prompt) => {
@@ -88,7 +103,7 @@ const Index = () => {
   };
 
   return (
-    <div className="min-h-screen bg-background dark">
+    <div className={`min-h-screen bg-background ${isDark ? "dark" : ""}`}>
       {/* Header */}
       <header className="sticky top-0 z-50 glass border-b border-border/50">
         <div className="container mx-auto px-6 py-4">
@@ -105,7 +120,8 @@ const Index = () => {
             <div className="flex-1 max-w-xl">
               <SearchBar value={searchQuery} onChange={setSearchQuery} />
             </div>
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2">
+              <ThemeToggle isDark={isDark} onToggle={toggleTheme} />
               <Button
                 onClick={() => setShowAddDialog(true)}
                 className="gap-2"
