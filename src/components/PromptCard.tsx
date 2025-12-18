@@ -10,9 +10,20 @@ interface PromptCardProps {
 }
 
 export function PromptCard({ prompt, onVote, onTagClick, style }: PromptCardProps) {
-  const handleCopy = () => {
+  const handleCopy = (e: React.MouseEvent) => {
+    e.stopPropagation();
     navigator.clipboard.writeText(prompt.content);
     toast.success("提示词已复制到剪贴板");
+  };
+
+  const handleVote = (e: React.MouseEvent, vote: 'up' | 'down') => {
+    e.stopPropagation();
+    onVote(prompt.id, vote);
+  };
+
+  const handleTagClick = (e: React.MouseEvent, tag: string) => {
+    e.stopPropagation();
+    onTagClick(tag);
   };
 
   return (
@@ -34,7 +45,7 @@ export function PromptCard({ prompt, onVote, onTagClick, style }: PromptCardProp
         {prompt.tags.map((tag) => (
           <button
             key={tag}
-            onClick={() => onTagClick(tag)}
+            onClick={(e) => handleTagClick(e, tag)}
             className="tag-chip"
           >
             #{tag}
@@ -50,14 +61,14 @@ export function PromptCard({ prompt, onVote, onTagClick, style }: PromptCardProp
         
         <div className="flex items-center gap-2">
           <button
-            onClick={() => onVote(prompt.id, 'up')}
+            onClick={(e) => handleVote(e, 'up')}
             className={`vote-button up ${prompt.userVote === 'up' ? 'active' : ''}`}
           >
             <ThumbsUp className="h-4 w-4" />
             <span>{prompt.upvotes}</span>
           </button>
           <button
-            onClick={() => onVote(prompt.id, 'down')}
+            onClick={(e) => handleVote(e, 'down')}
             className={`vote-button down ${prompt.userVote === 'down' ? 'active' : ''}`}
           >
             <ThumbsDown className="h-4 w-4" />
