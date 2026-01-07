@@ -14,7 +14,7 @@ This is a React-based "AI Prompt Market" (AI 提示词市场) - an internal prom
 - **Styling**: Tailwind CSS with custom utility classes in `src/index.css`
 - **Routing**: React Router DOM
 - **State Management**: React hooks (useState, useMemo, useEffect)
-- **Data Fetching**: TanStack React Query (configured but mock data used)
+- **Data Fetching**: TanStack React Query (configured) with dual-mode support for mock data or Supabase backend
 - **Form Handling**: React Hook Form with Zod validation
 - **Icons**: Lucide React
 - **Theme**: next-themes for dark/light mode with localStorage persistence
@@ -60,6 +60,28 @@ src/
 └── index.css            # Global styles with Tailwind directives and custom classes
 ```
 
+## Supabase Backend Integration
+
+The application supports dual-mode operation:
+- **Mock Mode**: Uses local mock data from `src/data/mockData.ts` (default when Supabase not configured)
+- **Supabase Mode**: Full backend integration with authentication, data persistence, and real-time features
+
+### Environment Variables
+To enable Supabase mode, set these environment variables:
+- `VITE_SUPABASE_URL`: Your Supabase project URL
+- `VITE_SUPABASE_ANON_KEY`: Your Supabase anon key
+
+### Backend Services (`src/lib/supabaseService.ts`)
+- **Auth Service**: User registration, login, logout, and session management
+- **Prompts Service**: CRUD operations for prompts, search, and filtering
+- **Votes Service**: Upvote/downvote functionality with conflict resolution
+- **Categories Service**: Category management with dynamic prompt counts
+
+### Database Schema
+- **prompts**: Stores prompt data with author relationship
+- **profiles**: User profile information
+- **votes**: User votes on prompts (prevents duplicate voting)
+
 ## Key Architecture Notes
 
 ### Data Models
@@ -94,10 +116,11 @@ interface Category {
 ### State Management Pattern
 
 The main application state (`src/pages/Index.tsx`) is managed through React hooks:
-- Prompts are stored in component state (not persisted)
+- Prompts are stored in component state (persisted in Supabase when configured)
 - Category selection and search query filter the displayed prompts
-- User authentication is simulated with local state
+- User authentication is handled by Supabase auth (or simulated locally in mock mode)
 - Theme preference is persisted in localStorage
+- Loading states and error handling for async operations
 
 ### Custom CSS Classes
 

@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import { SearchBar } from "@/components/SearchBar";
 import { CategorySidebar } from "@/components/CategorySidebar";
 import { PromptCard } from "@/components/PromptCard";
@@ -30,102 +30,157 @@ const Index = () => {
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [isDark, setIsDark] = useState(true);
   const [isLoading, setIsLoading] = useState(true);
+  const [isInitialized, setIsInitialized] = useState(false);
   const useSupabase = isSupabaseConfigured();
 
-  // Initialize theme and load data
+  // Refs for tracking mounted state and pending requests
+  const isMountedRef = useRef(true);
+  const isLoadingRef = useRef(false);
+  const pendingFilterRef = useRef({ category: 'all', search: '' });
+
+  // Initialize theme
   useEffect(() => {
     const saved = localStorage.getItem("theme");
     if (saved) {
       setIsDark(saved === "dark");
     }
+    return () => {
+      isMountedRef.current = false;
+    };
   }, []);
 
-  // Load initial data
+  // Initial setup - load data and setup auth listener
   useEffect(() => {
-    if (useSupabase) {
-      loadData();
-      setupAuthListener();
-    } else {
+    if (!useSupabase) {
       setIsLoading(false);
       setPrompts(initialPrompts);
       setCategories(mockCategories);
+      setIsInitialized(true);
+      return;
     }
-  }, [useSupabase]);
 
-  // Reload data when category or search changes (Supabase mode)
-  useEffect(() => {
-    if (useSupabase && !isLoading) {
-      if (searchQuery) {
-        loadSearchResults(searchQuery);
-      } else if (activeCategory) {
-        loadCategoryPrompts(activeCategory);
-      } else {
-        loadAllPrompts();
+    const loadData = async () => {
+      if (isLoadingRef.current) return;
+      isLoadingRef.current = true;
+
+      setIsLoading(true);
+      try {
+        // First, try to load public data without authentication
+        // This ensures the app works even if auth fails
+        const [cats, promptsData] = await Promise.all([
+          categoriesService.getCategories(),
+          promptsService.getPublishedPrompts(),
+        ]);
+
+        if (!isMountedRef.current) return;
+
+        setCategories(cats);
+        setPrompts(promptsData);
+
+        // Then, try to get current user in the background (non-blocking)
+        // This won't affect the initial page load if it fails
+        authService.getCurrentUser().then(user => {
+          if (user && isMountedRef.current) {
+            setCurrentUser(user);
+            // Reload with user-specific data if user is found
+            Promise.all([
+              categoriesService.getCategories(),
+              promptsService.getPublishedPromptsForUser(user.id),
+            ]).then(([cats, prompts]) => {
+              if (isMountedRef.current) {
+                setCategories(cats);
+                setPrompts(prompts);
+              }
+            }).catch(err => {
+              console.error('Failed to load user-specific data:', err);
+            });
+          }
+        }).catch(err => {
+          console.error('Failed to get current user:', err);
+        });
+      } catch (error: any) {
+        if (error.name === 'AbortError') {
+          console.warn('Data loading was aborted');
+          return;
+        }
+        console.error("Failed to load data:", error);
+        // Fall back to mock data on error
+        if (isMountedRef.current) {
+          setPrompts(initialPrompts);
+          setCategories(mockCategories);
+        }
+      } finally {
+        isLoadingRef.current = false;
+        if (isMountedRef.current) {
+          setIsLoading(false);
+          setIsInitialized(true);
+          pendingFilterRef.current = { category: activeCategory, search: searchQuery };
+        }
       }
-    }
-  }, [activeCategory, searchQuery, useSupabase, isLoading]);
+    };
 
-  const loadData = async () => {
-    setIsLoading(true);
-    try {
-      const [user, cats, promptsData] = await Promise.all([
-        authService.getCurrentUser(),
-        categoriesService.getCategories(),
-        promptsService.getPublishedPrompts(currentUser?.id),
-      ]);
+    loadData();
 
-      if (user) setCurrentUser(user);
-      setCategories(cats);
-      setPrompts(promptsData);
-    } catch (error) {
-      console.error("Failed to load data:", error);
-      // Fall back to mock data
-      setPrompts(initialPrompts);
-      setCategories(mockCategories);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const loadAllPrompts = async () => {
-    if (!useSupabase) return;
-    try {
-      const data = await promptsService.getPublishedPrompts(currentUser?.id);
-      setPrompts(data);
-    } catch (error) {
-      console.error("Failed to load prompts:", error);
-    }
-  };
-
-  const loadCategoryPrompts = async (categoryId: string) => {
-    if (!useSupabase) return;
-    try {
-      const data = await promptsService.getPromptsByCategory(categoryId, currentUser?.id);
-      setPrompts(data);
-    } catch (error) {
-      console.error("Failed to load category prompts:", error);
-    }
-  };
-
-  const loadSearchResults = async (query: string) => {
-    if (!useSupabase) return;
-    try {
-      const data = await promptsService.searchPrompts(query, currentUser?.id);
-      setPrompts(data);
-    } catch (error) {
-      console.error("Failed to search prompts:", error);
-    }
-  };
-
-  const setupAuthListener = () => {
+    // Setup auth listener
     const { data } = authService.onAuthStateChange((user) => {
+      if (!isMountedRef.current) return;
       setCurrentUser(user);
       if (user) {
-        loadAllPrompts();
+        // Reload prompts when user logs in
+        pendingFilterRef.current = { category: 'all', search: '' };
+        loadPromptsData('all', '');
       }
     });
-    return () => data.subscription.unsubscribe();
-  };
+
+    return () => {
+      data.subscription.unsubscribe();
+    };
+  }, [useSupabase]); // Only run when useSupabase changes (on mount)
+
+  // Load prompts based on filter (only after initialization)
+  useEffect(() => {
+    if (!useSupabase || !isInitialized) return;
+
+    const currentFilter = { category: activeCategory, search: searchQuery };
+    const isDifferent =
+      pendingFilterRef.current.category !== currentFilter.category ||
+      pendingFilterRef.current.search !== currentFilter.search;
+
+    if (isDifferent) {
+      loadPromptsData(activeCategory, searchQuery);
+    }
+  }, [activeCategory, searchQuery, useSupabase, isInitialized]);
+
+  const loadPromptsData = useCallback(async (category: string, search: string) => {
+    if (!useSupabase || isLoadingRef.current) return;
+    isLoadingRef.current = true;
+    pendingFilterRef.current = { category, search };
+
+    try {
+      let data: Prompt[];
+
+      if (search) {
+        // For search, we'll use the basic method for now
+        data = await promptsService.searchPrompts(search);
+      } else if (category === 'all') {
+        // Use appropriate method based on authentication
+        data = currentUser
+          ? await promptsService.getPublishedPromptsForUser(currentUser.id)
+          : await promptsService.getPublishedPrompts();
+      } else {
+        data = await promptsService.getPromptsByCategory(category);
+      }
+
+      if (isMountedRef.current) {
+        setPrompts(data);
+      }
+    } catch (error: any) {
+      if (error.name === 'AbortError') return;
+      console.error("Failed to load prompts:", error);
+    } finally {
+      isLoadingRef.current = false;
+    }
+  }, [useSupabase, currentUser]);
 
   const toggleTheme = () => {
     const newTheme = !isDark;
@@ -156,21 +211,51 @@ const Index = () => {
     if (useSupabase && currentUser?.id) {
       try {
         await votesService.vote(id, vote, currentUser.id);
-        // Refresh prompts to get updated vote counts
-        if (searchQuery) {
-          await loadSearchResults(searchQuery);
-        } else if (activeCategory) {
-          await loadCategoryPrompts(activeCategory);
-        } else {
-          await loadAllPrompts();
-        }
+
+        // Optimistically update UI
+        setPrompts((prev) =>
+          prev.map((p) => {
+            if (p.id !== id) return p;
+
+            const isTogglingOff = p.userVote === vote;
+            const isChangingVote = p.userVote && p.userVote !== vote;
+
+            let newUpvotes = p.upvotes;
+            let newDownvotes = p.downvotes;
+            let newUserVote: 'up' | 'down' | null = vote;
+
+            if (isTogglingOff) {
+              newUserVote = null;
+              if (vote === 'up') newUpvotes--;
+              if (vote === 'down') newDownvotes--;
+            } else if (isChangingVote) {
+              // Changing vote type
+              if (p.userVote === 'up') newUpvotes--;
+              if (p.userVote === 'down') newDownvotes--;
+              if (vote === 'up') newUpvotes++;
+              if (vote === 'down') newDownvotes++;
+            } else {
+              // New vote
+              if (vote === 'up') newUpvotes++;
+              if (vote === 'down') newDownvotes++;
+            }
+
+            return { ...p, upvotes: newUpvotes, downvotes: newDownvotes, userVote: newUserVote };
+          })
+        );
+
+        // Refresh to get accurate counts from server
+        await loadPromptsData(activeCategory, searchQuery);
+
         // Update selected prompt if open
         if (selectedPrompt?.id === id) {
           const updatedPrompt = await promptsService.getPromptById(id);
-          if (updatedPrompt) setSelectedPrompt(updatedPrompt);
+          if (updatedPrompt && isMountedRef.current) setSelectedPrompt(updatedPrompt);
         }
       } catch (error: any) {
         toast.error(error.message || "投票失败");
+        // Revert optimistic update on error
+        await loadPromptsData(activeCategory, searchQuery);
         return;
       }
     } else if (!useSupabase) {
@@ -230,8 +315,9 @@ const Index = () => {
           currentUser.id
         );
         toast.success("提示词添加成功");
-        await loadAllPrompts();
-        await categoriesService.getCategories().then(setCategories);
+        await loadPromptsData(activeCategory, searchQuery);
+        const cats = await categoriesService.getCategories();
+        if (isMountedRef.current) setCategories(cats);
       } catch (error: any) {
         toast.error(error.message || "添加失败");
         return;

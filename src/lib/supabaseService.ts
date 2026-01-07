@@ -1,4 +1,4 @@
-import { supabase, isSupabaseConfigured } from './supabase';
+import { supabase, supabaseAnonymous, isSupabaseConfigured } from './supabase';
 import type {
   Prompt,
   CreatePromptInput,
@@ -16,21 +16,87 @@ import type {
 export const authService = {
   // Get current user
   getCurrentUser: async (): Promise<CurrentUser | null> => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return null;
+    try {
+      // Check if we have a session first
+      const { data: { session } } = await supabase.auth.getSession();
+      console.log('Current session check:', session ? 'Has session' : 'No session');
 
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('*')
-      .eq('id', user.id)
-      .single();
+      if (!session) {
+        console.log('No active session found');
+        return null;
+      }
 
-    return {
-      id: user.id,
-      email: user.email || '',
-      name: profile?.name || user.user_metadata?.name || user.email || '',
-      role: profile?.role || 'user',
-    };
+      // If we have a session but getUser fails, it might be expired
+      // Try to refresh the session first
+      const { data: { user }, error: authError } = await supabase.auth.getUser();
+
+      // Handle auth errors (401, etc.)
+      if (authError) {
+        console.error('Auth error details:', authError);
+        if (authError.status === 401) {
+          console.warn('Auth session expired or invalid, attempting refresh');
+
+          // Try to refresh the session
+          const { data: refreshData, error: refreshError } = await supabase.auth.refreshSession();
+
+          if (refreshError) {
+            console.error('Failed to refresh session:', refreshError);
+            // Clear any stale session
+            await supabase.auth.signOut();
+            return null;
+          }
+
+          if (refreshData.user) {
+            console.log('Session refreshed successfully');
+            // Try getUser again with refreshed session
+            const { data: { user: refreshedUser } } = await supabase.auth.getUser();
+            if (!refreshedUser) return null;
+
+            const { data: profile } = await supabase
+              .from('profiles')
+              .select('*')
+              .eq('id', refreshedUser.id)
+              .single();
+
+            return {
+              id: refreshedUser.id,
+              email: refreshedUser.email || '',
+              name: profile?.name || refreshedUser.user_metadata?.name || refreshedUser.email || '',
+              role: profile?.role || 'user',
+            };
+          }
+        }
+        console.error('Auth error:', authError);
+        return null;
+      }
+
+      if (!user) {
+        console.log('No user data returned from getUser()');
+        return null;
+      }
+
+      console.log('Successfully got user:', user.id);
+
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', user.id)
+        .single();
+
+      return {
+        id: user.id,
+        email: user.email || '',
+        name: profile?.name || user.user_metadata?.name || user.email || '',
+        role: profile?.role || 'user',
+      };
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.warn('Auth request was aborted (likely due to timeout)');
+        return null;
+      }
+      console.error('Error getting current user:', error);
+      return null;
+    }
   },
 
   // Sign in with email/password
@@ -97,8 +163,18 @@ export const authService = {
   onAuthStateChange: (callback: (user: CurrentUser | null) => void) => {
     return supabase.auth.onAuthStateChange(async (event, session) => {
       if (session?.user) {
-        const user = await authService.getCurrentUser();
-        callback(user);
+        try {
+          const user = await authService.getCurrentUser();
+          callback(user);
+        } catch (error: any) {
+          if (error.name === 'AbortError') {
+            console.warn('Auth state change request was aborted');
+            callback(null);
+          } else {
+            console.error('Error getting current user:', error);
+            callback(null);
+          }
+        }
       } else {
         callback(null);
       }
@@ -112,37 +188,134 @@ export const authService = {
 
 export const promptsService = {
   // Get all published prompts (for public/guest view)
-  getPublishedPrompts: async (userId?: string): Promise<Prompt[]> => {
+  getPublishedPrompts: async (): Promise<Prompt[]> => {
     if (!isSupabaseConfigured()) return [];
 
-    let query = supabase
-      .from('prompts')
-      .select(`
-        *,
-        profiles!inner (
-          name
-        )
-      `)
-      .eq('published', true)
-      .order('created_at', { ascending: false });
+    try {
+      // Add timeout controller
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
 
-    const { data, error } = await query;
+      // For public view, we only show published prompts
+      // Use the anonymous client to avoid auth issues
+      const query = supabaseAnonymous
+        .from('prompts')
+        .select(`
+          id,
+          title,
+          description,
+          content,
+          category,
+          tags,
+          upvotes,
+          downvotes,
+          created_at,
+          author_id,
+          published
+        `)
+        .eq('published', true)
+        .order('created_at', { ascending: false })
+        .abortSignal(controller.signal);
 
-    if (error) throw error;
+      const { data, error } = await query;
 
-    return data.map((p: any) => ({
-      id: p.id,
-      title: p.title,
-      description: p.description,
-      content: p.content,
-      category: p.category,
-      tags: p.tags || [],
-      upvotes: p.upvotes,
-      downvotes: p.downvotes,
-      author: p.profiles.name,
-      createdAt: p.created_at,
-      userVote: p.user_vote,
-    }));
+      clearTimeout(timeoutId);
+
+      if (error) {
+        // Handle RLS or permission errors
+        if (error.code === '42501' || error.code === 'PGRST116') {
+          console.warn('Access denied to prompts table - check RLS policies');
+          return [];
+        }
+        if (error.status === 401) {
+          console.warn('Unauthorized access to prompts - session may be expired');
+          return [];
+        }
+        throw error;
+      }
+
+      // For anonymous users, we need to get author names separately or use a default
+      const promptsWithAuthor = data.map((p: any) => ({
+        id: p.id,
+        title: p.title,
+        description: p.description,
+        content: p.content,
+        category: p.category,
+        tags: p.tags || [],
+        upvotes: p.upvotes,
+        downvotes: p.downvotes,
+        author: 'Anonymous', // Default for anonymous access
+        createdAt: p.created_at,
+        userVote: null, // Anonymous users don't have votes
+      }));
+
+      return promptsWithAuthor;
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.warn('Prompts request was aborted (likely due to timeout)');
+        return [];
+      }
+      console.error('Error fetching prompts:', error);
+      return [];
+    }
+  },
+
+  // Get prompts with user-specific data (for authenticated users)
+  getPublishedPromptsForUser: async (userId: string): Promise<Prompt[]> => {
+    if (!isSupabaseConfigured() || !userId) return [];
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+      const query = supabase
+        .from('prompts')
+        .select(`
+          *,
+          profiles!inner (
+            name
+          ),
+          votes!user_vote (
+            vote_type
+          )
+        `)
+        .eq('published', true)
+        .order('created_at', { ascending: false })
+        .abortSignal(controller.signal);
+
+      const { data, error } = await query;
+
+      clearTimeout(timeoutId);
+
+      if (error) {
+        if (error.code === '42501' || error.code === 'PGRST116') {
+          console.warn('Access denied to prompts table');
+          return [];
+        }
+        throw error;
+      }
+
+      return data.map((p: any) => ({
+        id: p.id,
+        title: p.title,
+        description: p.description,
+        content: p.content,
+        category: p.category,
+        tags: p.tags || [],
+        upvotes: p.upvotes,
+        downvotes: p.downvotes,
+        author: p.profiles?.name || 'Anonymous',
+        createdAt: p.created_at,
+        userVote: p.votes?.[0]?.vote_type || null,
+      }));
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.warn('Prompts request was aborted');
+        return [];
+      }
+      console.error('Error fetching user prompts:', error);
+      return [];
+    }
   },
 
   // Get prompts by category
@@ -184,37 +357,67 @@ export const promptsService = {
     }));
   },
 
-  // Search prompts
-  searchPrompts: async (query: string, userId?: string): Promise<Prompt[]> => {
+  // Search prompts (anonymous friendly)
+  searchPrompts: async (query: string): Promise<Prompt[]> => {
     if (!isSupabaseConfigured()) return [];
 
-    const { data, error } = await supabase
-      .from('prompts')
-      .select(`
-        *,
-        profiles!inner (
-          name
-        )
-      `)
-      .eq('published', true)
-      .or(`title.ilike.%${query}%,description.ilike.%${query}%,content.ilike.%${query}%`)
-      .order('created_at', { ascending: false });
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
 
-    if (error) throw error;
+      const { data, error } = await supabaseAnonymous
+        .from('prompts')
+        .select(`
+          id,
+          title,
+          description,
+          content,
+          category,
+          tags,
+          upvotes,
+          downvotes,
+          created_at
+        `)
+        .eq('published', true)
+        .or(`title.ilike.%${query}%,description.ilike.%${query}%,content.ilike.%${query}%`)
+        .order('created_at', { ascending: false })
+        .abortSignal(controller.signal);
 
-    return data.map((p: any) => ({
-      id: p.id,
-      title: p.title,
-      description: p.description,
-      content: p.content,
-      category: p.category,
-      tags: p.tags || [],
-      upvotes: p.upvotes,
-      downvotes: p.downvotes,
-      author: p.profiles.name,
-      createdAt: p.created_at,
-      userVote: p.user_vote,
-    }));
+      clearTimeout(timeoutId);
+
+      if (error) {
+        if (error.code === '42501' || error.code === 'PGRST116') {
+          console.warn('Access denied to prompts table for search');
+          return [];
+        }
+        if (error.status === 401) {
+          console.warn('Unauthorized search access');
+          return [];
+        }
+        throw error;
+      }
+
+      return data.map((p: any) => ({
+        id: p.id,
+        title: p.title,
+        description: p.description,
+        content: p.content,
+        category: p.category,
+        tags: p.tags || [],
+        upvotes: p.upvotes,
+        downvotes: p.downvotes,
+        author: 'Anonymous', // For anonymous search
+        createdAt: p.created_at,
+        userVote: null, // Anonymous users don't have votes
+      }));
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.warn('Search request was aborted');
+        return [];
+      }
+      console.error('Error searching prompts:', error);
+      return [];
+    }
   },
 
   // Get user's own prompts (including unpublished)
@@ -402,22 +605,59 @@ export const votesService = {
     if (!isSupabaseConfigured()) return;
 
     // Check if user already voted
-    const { data: existingVote } = await supabase
+    const { data: existingVote, error: checkError } = await supabase
       .from('votes')
       .select('*')
       .eq('user_id', userId)
       .eq('prompt_id', promptId)
-      .single();
+      .maybeSingle();
+
+    if (checkError && checkError.code !== 'PGRST116') {
+      throw checkError;
+    }
 
     if (existingVote) {
-      // Remove existing vote
-      await supabase
+      // If same vote type, just remove it (toggle off)
+      if (existingVote.vote_type === voteType) {
+        const { error: deleteError } = await supabase
+          .from('votes')
+          .delete()
+          .eq('user_id', userId)
+          .eq('prompt_id', promptId);
+
+        if (deleteError) throw deleteError;
+
+        // Decrement prompt count
+        const { data: prompt } = await supabase
+          .from('prompts')
+          .select('upvotes, downvotes')
+          .eq('id', promptId)
+          .single();
+
+        if (prompt) {
+          const { error: updateError } = await supabase
+            .from('prompts')
+            .update({
+              upvotes: existingVote.vote_type === 'up' ? Math.max(0, prompt.upvotes - 1) : prompt.upvotes,
+              downvotes: existingVote.vote_type === 'down' ? Math.max(0, prompt.downvotes - 1) : prompt.downvotes,
+            })
+            .eq('id', promptId);
+          if (updateError) throw updateError;
+        }
+        return;
+      }
+
+      // Different vote type - update the existing vote instead of delete+insert
+      // This avoids the 409 conflict
+      const { error: updateVoteError } = await supabase
         .from('votes')
-        .delete()
+        .update({ vote_type: voteType })
         .eq('user_id', userId)
         .eq('prompt_id', promptId);
 
-      // Update prompt counts
+      if (updateVoteError) throw updateVoteError;
+
+      // Update prompt counts - remove old vote, add new vote
       const { data: prompt } = await supabase
         .from('prompts')
         .select('upvotes, downvotes')
@@ -425,27 +665,26 @@ export const votesService = {
         .single();
 
       if (prompt) {
-        await supabase
+        const { error: updatePromptError } = await supabase
           .from('prompts')
           .update({
-            upvotes: existingVote.vote_type === 'up' ? prompt.upvotes - 1 : prompt.upvotes,
-            downvotes: existingVote.vote_type === 'down' ? prompt.downvotes - 1 : prompt.downvotes,
+            upvotes: voteType === 'up' ? prompt.upvotes + 1 : Math.max(0, prompt.upvotes - 1),
+            downvotes: voteType === 'down' ? prompt.downvotes + 1 : Math.max(0, prompt.downvotes - 1),
           })
           .eq('id', promptId);
+        if (updatePromptError) throw updatePromptError;
       }
-
-      // If same vote type, just remove (toggle off)
-      if (existingVote.vote_type === voteType) {
-        return;
-      }
+      return;
     }
 
-    // Add new vote
-    await supabase.from('votes').insert({
+    // No existing vote - insert new one
+    const { error: insertError } = await supabase.from('votes').insert({
       user_id: userId,
       prompt_id: promptId,
       vote_type: voteType,
     });
+
+    if (insertError) throw insertError;
 
     // Update prompt counts
     const { data: prompt } = await supabase
@@ -455,13 +694,14 @@ export const votesService = {
       .single();
 
     if (prompt) {
-      await supabase
+      const { error: updatePromptError } = await supabase
         .from('prompts')
         .update({
           upvotes: voteType === 'up' ? prompt.upvotes + 1 : prompt.upvotes,
           downvotes: voteType === 'down' ? prompt.downvotes + 1 : prompt.downvotes,
         })
         .eq('id', promptId);
+      if (updatePromptError) throw updatePromptError;
     }
   },
 
@@ -499,27 +739,86 @@ export const categoriesService = {
       ];
     }
 
-    const { data, error } = await supabase
-      .from('prompts')
-      .select('category')
-      .eq('published', true);
+    try {
+      // Add timeout controller
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
 
-    if (error) throw error;
+      const { data, error } = await supabaseAnonymous
+        .from('prompts')
+        .select('category')
+        .eq('published', true)
+        .abortSignal(controller.signal);
 
-    const categoryCounts = data.reduce((acc, prompt) => {
-      acc[prompt.category] = (acc[prompt.category] || 0) + 1;
-      return acc;
-    }, {} as Record<string, number>);
+      clearTimeout(timeoutId);
 
-    const baseCategories: Category[] = [
-      { id: 'all', name: 'All', icon: 'Grid3x3', count: data.length },
-      { id: 'coding', name: 'Coding', icon: 'Code2', count: categoryCounts['coding'] || 0 },
-      { id: 'writing', name: 'Writing', icon: 'FileText', count: categoryCounts['writing'] || 0 },
-      { id: 'marketing', name: 'Marketing', icon: 'Megaphone', count: categoryCounts['marketing'] || 0 },
-      { id: 'productivity', name: 'Productivity', icon: 'Zap', count: categoryCounts['productivity'] || 0 },
-      { id: 'design', name: 'Design', icon: 'Palette', count: categoryCounts['design'] || 0 },
-    ];
+      if (error) {
+        // Handle RLS or permission errors
+        if (error.code === '42501' || error.code === 'PGRST116') {
+          console.warn('Access denied to prompts table - check RLS policies');
+          // Return mock categories on RLS error
+          return [
+            { id: 'all', name: 'All', icon: 'Grid3x3', count: 0 },
+            { id: 'coding', name: 'Coding', icon: 'Code2', count: 0 },
+            { id: 'writing', name: 'Writing', icon: 'FileText', count: 0 },
+            { id: 'marketing', name: 'Marketing', icon: 'Megaphone', count: 0 },
+            { id: 'productivity', name: 'Productivity', icon: 'Zap', count: 0 },
+            { id: 'design', name: 'Design', icon: 'Palette', count: 0 },
+          ];
+        }
+        if (error.status === 401) {
+          console.warn('Unauthorized access to prompts - session may be expired');
+          // Return mock categories on 401
+          return [
+            { id: 'all', name: 'All', icon: 'Grid3x3', count: 0 },
+            { id: 'coding', name: 'Coding', icon: 'Code2', count: 0 },
+            { id: 'writing', name: 'Writing', icon: 'FileText', count: 0 },
+            { id: 'marketing', name: 'Marketing', icon: 'Megaphone', count: 0 },
+            { id: 'productivity', name: 'Productivity', icon: 'Zap', count: 0 },
+            { id: 'design', name: 'Design', icon: 'Palette', count: 0 },
+          ];
+        }
+        throw error;
+      }
 
-    return baseCategories;
+      const categoryCounts = data.reduce((acc, prompt) => {
+        acc[prompt.category] = (acc[prompt.category] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+
+      const baseCategories: Category[] = [
+        { id: 'all', name: 'All', icon: 'Grid3x3', count: data.length },
+        { id: 'coding', name: 'Coding', icon: 'Code2', count: categoryCounts['coding'] || 0 },
+        { id: 'writing', name: 'Writing', icon: 'FileText', count: categoryCounts['writing'] || 0 },
+        { id: 'marketing', name: 'Marketing', icon: 'Megaphone', count: categoryCounts['marketing'] || 0 },
+        { id: 'productivity', name: 'Productivity', icon: 'Zap', count: categoryCounts['productivity'] || 0 },
+        { id: 'design', name: 'Design', icon: 'Palette', count: categoryCounts['design'] || 0 },
+      ];
+
+      return baseCategories;
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.warn('Categories request was aborted (likely due to timeout)');
+        // Return mock categories on abort
+        return [
+          { id: 'all', name: 'All', icon: 'Grid3x3', count: 0 },
+          { id: 'coding', name: 'Coding', icon: 'Code2', count: 0 },
+          { id: 'writing', name: 'Writing', icon: 'FileText', count: 0 },
+          { id: 'marketing', name: 'Marketing', icon: 'Megaphone', count: 0 },
+          { id: 'productivity', name: 'Productivity', icon: 'Zap', count: 0 },
+          { id: 'design', name: 'Design', icon: 'Palette', count: 0 },
+        ];
+      }
+      console.error('Error fetching categories:', error);
+      // Return mock categories on any error
+      return [
+        { id: 'all', name: 'All', icon: 'Grid3x3', count: 0 },
+        { id: 'coding', name: 'Coding', icon: 'Code2', count: 0 },
+        { id: 'writing', name: 'Writing', icon: 'FileText', count: 0 },
+        { id: 'marketing', name: 'Marketing', icon: 'Megaphone', count: 0 },
+        { id: 'productivity', name: 'Productivity', icon: 'Zap', count: 0 },
+        { id: 'design', name: 'Design', icon: 'Palette', count: 0 },
+      ];
+    }
   },
 };
