@@ -1,5 +1,16 @@
 import { Category } from "@/types/prompt";
-import { LayoutGrid, PenLine, Code2, BarChart3, Palette, Headphones, Folder, LucideIcon } from "lucide-react";
+import {
+  LayoutGrid,
+  PenLine,
+  Code2,
+  BarChart3,
+  Palette,
+  Headphones,
+  Megaphone,
+  Zap,
+  Folder,
+  LucideIcon
+} from "lucide-react";
 
 interface CategorySidebarProps {
   categories: Category[];
@@ -14,6 +25,9 @@ const iconMap: Record<string, LucideIcon> = {
   BarChart3,
   Palette,
   HeadphonesIcon: Headphones,
+  Megaphone,
+  Zap,
+  Grid3x3: LayoutGrid,
   Folder,
 };
 

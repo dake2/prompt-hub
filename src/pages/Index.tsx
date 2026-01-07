@@ -6,32 +6,126 @@ import { PromptDetail } from "@/components/PromptDetail";
 import { AddPromptDialog } from "@/components/AddPromptDialog";
 import { LoginDialog } from "@/components/LoginDialog";
 import { ThemeToggle } from "@/components/ThemeToggle";
-import { categories, prompts as initialPrompts } from "@/data/mockData";
-import { Prompt } from "@/types/prompt";
+import { categories as mockCategories, prompts as initialPrompts } from "@/data/mockData";
+import { Prompt, CurrentUser, Category } from "@/types/prompt";
 import { Button } from "@/components/ui/button";
 import { Sparkles, Plus, LogIn, User, LogOut } from "lucide-react";
-
-interface CurrentUser {
-  name: string;
-  email: string;
-}
+import {
+  promptsService,
+  authService,
+  votesService,
+  categoriesService,
+} from "@/lib/supabaseService";
+import { isSupabaseConfigured } from "@/lib/supabase";
+import { toast } from "sonner";
 
 const Index = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [activeCategory, setActiveCategory] = useState("all");
   const [prompts, setPrompts] = useState<Prompt[]>(initialPrompts);
+  const [categories, setCategories] = useState<Category[]>(mockCategories);
   const [selectedPrompt, setSelectedPrompt] = useState<Prompt | null>(null);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [showLoginDialog, setShowLoginDialog] = useState(false);
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [isDark, setIsDark] = useState(true);
+  const [isLoading, setIsLoading] = useState(true);
+  const useSupabase = isSupabaseConfigured();
 
+  // Initialize theme and load data
   useEffect(() => {
     const saved = localStorage.getItem("theme");
     if (saved) {
       setIsDark(saved === "dark");
     }
   }, []);
+
+  // Load initial data
+  useEffect(() => {
+    if (useSupabase) {
+      loadData();
+      setupAuthListener();
+    } else {
+      setIsLoading(false);
+      setPrompts(initialPrompts);
+      setCategories(mockCategories);
+    }
+  }, [useSupabase]);
+
+  // Reload data when category or search changes (Supabase mode)
+  useEffect(() => {
+    if (useSupabase && !isLoading) {
+      if (searchQuery) {
+        loadSearchResults(searchQuery);
+      } else if (activeCategory) {
+        loadCategoryPrompts(activeCategory);
+      } else {
+        loadAllPrompts();
+      }
+    }
+  }, [activeCategory, searchQuery, useSupabase, isLoading]);
+
+  const loadData = async () => {
+    setIsLoading(true);
+    try {
+      const [user, cats, promptsData] = await Promise.all([
+        authService.getCurrentUser(),
+        categoriesService.getCategories(),
+        promptsService.getPublishedPrompts(currentUser?.id),
+      ]);
+
+      if (user) setCurrentUser(user);
+      setCategories(cats);
+      setPrompts(promptsData);
+    } catch (error) {
+      console.error("Failed to load data:", error);
+      // Fall back to mock data
+      setPrompts(initialPrompts);
+      setCategories(mockCategories);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const loadAllPrompts = async () => {
+    if (!useSupabase) return;
+    try {
+      const data = await promptsService.getPublishedPrompts(currentUser?.id);
+      setPrompts(data);
+    } catch (error) {
+      console.error("Failed to load prompts:", error);
+    }
+  };
+
+  const loadCategoryPrompts = async (categoryId: string) => {
+    if (!useSupabase) return;
+    try {
+      const data = await promptsService.getPromptsByCategory(categoryId, currentUser?.id);
+      setPrompts(data);
+    } catch (error) {
+      console.error("Failed to load category prompts:", error);
+    }
+  };
+
+  const loadSearchResults = async (query: string) => {
+    if (!useSupabase) return;
+    try {
+      const data = await promptsService.searchPrompts(query, currentUser?.id);
+      setPrompts(data);
+    } catch (error) {
+      console.error("Failed to search prompts:", error);
+    }
+  };
+
+  const setupAuthListener = () => {
+    const { data } = authService.onAuthStateChange((user) => {
+      setCurrentUser(user);
+      if (user) {
+        loadAllPrompts();
+      }
+    });
+    return () => data.subscription.unsubscribe();
+  };
 
   const toggleTheme = () => {
     const newTheme = !isDark;
@@ -40,6 +134,11 @@ const Index = () => {
   };
 
   const filteredPrompts = useMemo(() => {
+    if (useSupabase) {
+      return prompts;
+    }
+
+    // Use client-side filtering for mock mode
     return prompts.filter((prompt) => {
       const matchesSearch =
         searchQuery === "" ||
@@ -51,50 +150,105 @@ const Index = () => {
 
       return matchesSearch && matchesCategory;
     });
-  }, [prompts, searchQuery, activeCategory]);
+  }, [prompts, searchQuery, activeCategory, useSupabase]);
 
-  const handleVote = (id: string, vote: 'up' | 'down') => {
-    setPrompts((prev) =>
-      prev.map((prompt) => {
-        if (prompt.id !== id) return prompt;
-
-        const currentVote = prompt.userVote;
-        let newUpvotes = prompt.upvotes;
-        let newDownvotes = prompt.downvotes;
-        let newUserVote: 'up' | 'down' | null = vote;
-
-        // Remove previous vote
-        if (currentVote === 'up') newUpvotes--;
-        if (currentVote === 'down') newDownvotes--;
-
-        // Toggle off if clicking same vote
-        if (currentVote === vote) {
-          newUserVote = null;
+  const handleVote = async (id: string, vote: 'up' | 'down') => {
+    if (useSupabase && currentUser?.id) {
+      try {
+        await votesService.vote(id, vote, currentUser.id);
+        // Refresh prompts to get updated vote counts
+        if (searchQuery) {
+          await loadSearchResults(searchQuery);
+        } else if (activeCategory) {
+          await loadCategoryPrompts(activeCategory);
         } else {
-          // Add new vote
-          if (vote === 'up') newUpvotes++;
-          if (vote === 'down') newDownvotes++;
+          await loadAllPrompts();
         }
+        // Update selected prompt if open
+        if (selectedPrompt?.id === id) {
+          const updatedPrompt = await promptsService.getPromptById(id);
+          if (updatedPrompt) setSelectedPrompt(updatedPrompt);
+        }
+      } catch (error: any) {
+        toast.error(error.message || "投票失败");
+        return;
+      }
+    } else if (!useSupabase) {
+      // Mock mode - local state update
+      setPrompts((prev) =>
+        prev.map((prompt) => {
+          if (prompt.id !== id) return prompt;
 
-        return {
-          ...prompt,
-          upvotes: newUpvotes,
-          downvotes: newDownvotes,
-          userVote: newUserVote,
-        };
-      })
-    );
+          const currentVote = prompt.userVote;
+          let newUpvotes = prompt.upvotes;
+          let newDownvotes = prompt.downvotes;
+          let newUserVote: 'up' | 'down' | null = vote;
+
+          if (currentVote === 'up') newUpvotes--;
+          if (currentVote === 'down') newDownvotes--;
+
+          if (currentVote === vote) {
+            newUserVote = null;
+          } else {
+            if (vote === 'up') newUpvotes++;
+            if (vote === 'down') newDownvotes++;
+          }
+
+          return {
+            ...prompt,
+            upvotes: newUpvotes,
+            downvotes: newDownvotes,
+            userVote: newUserVote,
+          };
+        })
+      );
+    } else {
+      toast.error("请先登录");
+      setShowLoginDialog(true);
+      return;
+    }
   };
 
-  const handleAddPrompt = (newPrompt: Prompt) => {
-    setPrompts((prev) => [newPrompt, ...prev]);
+  const handleAddPrompt = async (newPrompt: Prompt) => {
+    if (!currentUser?.id) {
+      toast.error("请先登录");
+      setShowLoginDialog(true);
+      return;
+    }
+
+    if (useSupabase) {
+      try {
+        await promptsService.createPrompt(
+          {
+            title: newPrompt.title,
+            description: newPrompt.description,
+            content: newPrompt.content,
+            category: newPrompt.category,
+            tags: newPrompt.tags,
+            published: true,
+          },
+          currentUser.id
+        );
+        toast.success("提示词添加成功");
+        await loadAllPrompts();
+        await categoriesService.getCategories().then(setCategories);
+      } catch (error: any) {
+        toast.error(error.message || "添加失败");
+        return;
+      }
+    } else {
+      setPrompts((prev) => [newPrompt, ...prev]);
+    }
   };
 
   const handleLogin = (user: CurrentUser) => {
     setCurrentUser(user);
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    if (useSupabase) {
+      await authService.signOut();
+    }
     setCurrentUser(null);
   };
 
@@ -114,7 +268,9 @@ const Index = () => {
               </div>
               <div>
                 <h1 className="text-xl font-bold text-foreground">AI 提示词市场</h1>
-                <p className="text-xs text-muted-foreground">内部提示词共享平台</p>
+                <p className="text-xs text-muted-foreground">
+                  {useSupabase ? "Supabase 后端" : "内部提示词共享平台 (模拟模式)"}
+                </p>
               </div>
             </div>
             <div className="flex-1 max-w-xl">
@@ -123,7 +279,13 @@ const Index = () => {
             <div className="flex items-center gap-2">
               <ThemeToggle isDark={isDark} onToggle={toggleTheme} />
               <Button
-                onClick={() => setShowAddDialog(true)}
+                onClick={() => {
+                  if (currentUser) {
+                    setShowAddDialog(true);
+                  } else {
+                    setShowLoginDialog(true);
+                  }
+                }}
                 className="gap-2"
               >
                 <Plus className="h-4 w-4" />
@@ -134,6 +296,9 @@ const Index = () => {
                   <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-muted">
                     <User className="h-4 w-4 text-muted-foreground" />
                     <span className="text-sm font-medium text-foreground">{currentUser.name}</span>
+                    {currentUser.role === 'admin' && (
+                      <span className="text-xs bg-primary text-primary-foreground px-1.5 py-0.5 rounded">Admin</span>
+                    )}
                   </div>
                   <Button variant="ghost" size="icon" onClick={handleLogout}>
                     <LogOut className="h-4 w-4" />
@@ -152,40 +317,46 @@ const Index = () => {
 
       {/* Main Content */}
       <main className="container mx-auto px-6 py-8">
-        <div className="flex gap-8">
-          {/* Sidebar */}
-          <CategorySidebar
-            categories={categories}
-            activeCategory={activeCategory}
-            onCategoryChange={setActiveCategory}
-          />
-
-          {/* Prompt Grid */}
-          <div className="flex-1">
-            {filteredPrompts.length === 0 ? (
-              <div className="text-center py-16">
-                <p className="text-muted-foreground">没有找到匹配的提示词</p>
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-                {filteredPrompts.map((prompt, index) => (
-                  <div
-                    key={prompt.id}
-                    onClick={() => setSelectedPrompt(prompt)}
-                    className="cursor-pointer"
-                  >
-                    <PromptCard
-                      prompt={prompt}
-                      onVote={handleVote}
-                      onTagClick={handleTagClick}
-                      style={{ animationDelay: `${index * 50}ms` }}
-                    />
-                  </div>
-                ))}
-              </div>
-            )}
+        {isLoading ? (
+          <div className="flex justify-center py-16">
+            <div className="text-muted-foreground">加载中...</div>
           </div>
-        </div>
+        ) : (
+          <div className="flex gap-8">
+            {/* Sidebar */}
+            <CategorySidebar
+              categories={categories}
+              activeCategory={activeCategory}
+              onCategoryChange={setActiveCategory}
+            />
+
+            {/* Prompt Grid */}
+            <div className="flex-1">
+              {filteredPrompts.length === 0 ? (
+                <div className="text-center py-16">
+                  <p className="text-muted-foreground">没有找到匹配的提示词</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                  {filteredPrompts.map((prompt, index) => (
+                    <div
+                      key={prompt.id}
+                      onClick={() => setSelectedPrompt(prompt)}
+                      className="cursor-pointer"
+                    >
+                      <PromptCard
+                        prompt={prompt}
+                        onVote={handleVote}
+                        onTagClick={handleTagClick}
+                        style={{ animationDelay: `${index * 50}ms` }}
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
       </main>
 
       {/* Detail Modal */}
